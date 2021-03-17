@@ -6,5 +6,6 @@
   "influxdb-port":  8086,
   "influxdb-measurement": "daylight",
   "influxdb-database":  "database",
-  "influxdb-retention-policy":  "autogen"
+  "influxdb-retention-policy":  "autogen",
+  "influxdb-skip-verify-ssl": false
 }

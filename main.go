@@ -23,6 +23,7 @@ type Configuration struct {
 	InfluxDBMeasurement     string        `json:"influxdb-measurement"`
 	InfluxDBDatabase        string        `json:"influxdb-database"`
 	InfluxDBRetentionPolicy string        `json:"influxdb-retention-policy"`
+	InfluxDBSkipVerifySsl   bool          `json:"influxdb-skip-verify-ssl"`
 }
 
 // Load a config file and return the Config struct
@@ -70,7 +71,8 @@ func main() {
 		)
 	}
 	influxConf := influxdb.Config{
-		URL: *host,
+		URL:       *host,
+		UnsafeSsl: config.InfluxDBSkipVerifySsl,
 	}
 	influxConn, err := influxdb.NewClient(influxConf)
 	if err != nil {
