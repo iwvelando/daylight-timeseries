@@ -1,86 +1,142 @@
 package main
 
 import (
-	"encoding/json"
+	"crypto/tls"
 	"flag"
 	"fmt"
-	_ "github.com/influxdata/influxdb1-client"
-	influxdb "github.com/influxdata/influxdb1-client"
+	influx "github.com/influxdata/influxdb-client-go/v2"
+	influxAPI "github.com/influxdata/influxdb-client-go/v2/api"
 	"github.com/nathan-osman/go-sunrise"
-	"go.uber.org/zap"
-	"net/url"
+	log "github.com/sirupsen/logrus"
+	"github.com/spf13/viper"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 )
 
-// Config represents a JSON-formatted config file
+// Config represents a YAML-formatted config file
 type Configuration struct {
-	Latitude                float64       `json:"latitude"`
-	Longitude               float64       `json:"longitude"`
-	PollInterval            time.Duration `json:"poll-interval"`
-	InfluxDBURL             string        `json:"influxdb-url"`
-	InfluxDBPort            int           `json:"influxdb-port"`
-	InfluxDBMeasurement     string        `json:"influxdb-measurement"`
-	InfluxDBDatabase        string        `json:"influxdb-database"`
-	InfluxDBRetentionPolicy string        `json:"influxdb-retention-policy"`
-	InfluxDBSkipVerifySsl   bool          `json:"influxdb-skip-verify-ssl"`
+	Latitude     float64
+	Longitude    float64
+	PollInterval time.Duration
+	InfluxDB     InfluxDB
+}
+
+type InfluxDB struct {
+	Address           string
+	Username          string
+	Password          string
+	MeasurementPrefix string
+	Database          string
+	RetentionPolicy   string
+	Token             string
+	Organization      string
+	Bucket            string
+	SkipVerifySsl     bool
+	FlushInterval     uint
 }
 
 // Load a config file and return the Config struct
-func LoadConfiguration(logger *zap.Logger, file string) Configuration {
+func LoadConfiguration(configPath string) (*Configuration, error) {
+	viper.SetConfigFile(configPath)
+	viper.AutomaticEnv()
+	viper.SetConfigType("yml")
 
-	var config Configuration
-	configFile, err := os.Open(file)
-	defer configFile.Close()
+	err := viper.ReadInConfig()
 	if err != nil {
-		logger.Warn(fmt.Sprintf("failed to open %s", file),
-			zap.String("op", "LoadConfiguration"),
-			zap.Error(err),
-		)
-		return config
+		return nil, fmt.Errorf("error reading config file %s, %s", configPath, err)
 	}
 
-	jsonParser := json.NewDecoder(configFile)
-	jsonParser.Decode(&config)
+	var configuration Configuration
+	err = viper.Unmarshal(&configuration)
+	if err != nil {
+		return nil, fmt.Errorf("unable to decode config into struct, %s", err)
+	}
 
-	return config
+	return &configuration, nil
+}
+
+type InfluxWriteConfigError struct{}
+
+func (r *InfluxWriteConfigError) Error() string {
+	return "must configure at least one of bucket or database/retention policy"
+}
+
+func InfluxConnect(config *Configuration) (influx.Client, influxAPI.WriteAPI, error) {
+	var auth string
+	if config.InfluxDB.Token != "" {
+		auth = config.InfluxDB.Token
+	} else if config.InfluxDB.Username != "" && config.InfluxDB.Password != "" {
+		auth = fmt.Sprintf("%s:%s", config.InfluxDB.Username, config.InfluxDB.Password)
+	} else {
+		auth = ""
+	}
+
+	var writeDest string
+	if config.InfluxDB.Bucket != "" {
+		writeDest = config.InfluxDB.Bucket
+	} else if config.InfluxDB.Database != "" && config.InfluxDB.RetentionPolicy != "" {
+		writeDest = fmt.Sprintf("%s/%s", config.InfluxDB.Database, config.InfluxDB.RetentionPolicy)
+	} else {
+		return nil, nil, &InfluxWriteConfigError{}
+	}
+
+	if config.InfluxDB.FlushInterval == 0 {
+		config.InfluxDB.FlushInterval = 30
+	}
+
+	options := influx.DefaultOptions().
+		SetFlushInterval(1000 * config.InfluxDB.FlushInterval).
+		SetTLSConfig(&tls.Config{
+			InsecureSkipVerify: config.InfluxDB.SkipVerifySsl,
+		})
+	client := influx.NewClientWithOptions(config.InfluxDB.Address, auth, options)
+
+	writeAPI := client.WriteAPI(config.InfluxDB.Organization, writeDest)
+
+	return client, writeAPI, nil
 }
 
 func main() {
 
-	// Initialize the structured logger
-	logger, err := zap.NewProduction()
-	if err != nil {
-		fmt.Println("{\"op\": \"main\", \"level\": \"fatal\", \"msg\": \"failed to initiate logger\"}")
-		os.Exit(1)
-	}
-	defer logger.Sync()
-
 	// Load the config file based on path provided via CLI or the default
-	configLocation := flag.String("config", "config.json", "path to configuration file")
+	configLocation := flag.String("config", "config.yaml", "path to configuration file")
 	flag.Parse()
-	config := LoadConfiguration(logger, *configLocation)
+	config, err := LoadConfiguration(*configLocation)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"op":    "main.LoadConfiguration",
+			"error": err,
+		}).Fatal("failed to load configuration")
+	}
 
 	// Initialize the InfluxDB connection
-	influxDBAddr := fmt.Sprintf("%s:%d", config.InfluxDBURL, config.InfluxDBPort)
-	host, err := url.Parse(influxDBAddr)
+	influxClient, writeAPI, err := InfluxConnect(config)
 	if err != nil {
-		logger.Fatal(fmt.Sprintf("failed to parse InfluxDB URL %s", influxDBAddr),
-			zap.String("op", "main"),
-			zap.Error(err),
-		)
+		log.WithFields(log.Fields{
+			"op":    "main",
+			"error": err,
+		}).Fatal("failed to initialize InfluxDB connection")
 	}
-	influxConf := influxdb.Config{
-		URL:       *host,
-		UnsafeSsl: config.InfluxDBSkipVerifySsl,
-	}
-	influxConn, err := influxdb.NewClient(influxConf)
-	if err != nil {
-		logger.Fatal("failed to initialize InfluxDB connection",
-			zap.String("op", "main"),
-			zap.Error(err),
-		)
-	}
+	defer influxClient.Close()
+	defer writeAPI.Flush()
+
+	errorsCh := writeAPI.Errors()
+
+	// Monitor InfluxDB write errors
+	go func() {
+		for err := range errorsCh {
+			log.WithFields(log.Fields{
+				"op":    "main",
+				"error": err,
+			}).Error("encountered error on writing to InfluxDB")
+		}
+	}()
+
+	// Look for SIGTERM or SIGINT
+	cancelCh := make(chan os.Signal, 1)
+	signal.Notify(cancelCh, syscall.SIGTERM, syscall.SIGINT)
 
 	now := time.Now()
 	sunriseTime, sunsetTime := sunrise.SunriseSunset(
@@ -91,37 +147,35 @@ func main() {
 		now.Day(),
 	)
 
-	for {
+	go func() {
+		for {
 
-		pollStartTime := int32(time.Now().Unix())
+			pollStartTime := int32(time.Now().Unix())
 
-		now = time.Now()
-		sunriseTime, sunsetTime = UpdateSunriseSunset(logger, config, sunriseTime, sunsetTime, now)
-		daylight := Daylight(sunriseTime, sunsetTime, now)
-		err := WriteToInflux(logger, config, influxConn, daylight, now)
-		if err != nil {
-			logger.Error("failed to write daylight data to InfluxDB",
-				zap.String("op", "main"),
-				zap.Error(err),
-			)
+			now = time.Now()
+			sunriseTime, sunsetTime = UpdateSunriseSunset(*config, sunriseTime, sunsetTime, now)
+			daylight := Daylight(sunriseTime, sunsetTime, now)
+			WriteToInflux(*config, writeAPI, daylight, now)
+
+			timeElapsed := int32(time.Now().Unix()) - pollStartTime
+			time.Sleep(config.PollInterval*time.Second - time.Duration(timeElapsed)*time.Second)
+
 		}
+	}()
 
-		timeElapsed := int32(time.Now().Unix()) - pollStartTime
-		time.Sleep(config.PollInterval*time.Second - time.Duration(timeElapsed)*time.Second)
-
-	}
+	sig := <-cancelCh
+	log.WithFields(log.Fields{
+		"op": "main",
+	}).Info(fmt.Sprintf("caught signal %v, flushing data to InfluxDB", sig))
+	writeAPI.Flush()
 
 }
 
-func UpdateSunriseSunset(logger *zap.Logger, config Configuration, currentSunrise time.Time, currentSunset time.Time, t time.Time) (time.Time, time.Time) {
+func UpdateSunriseSunset(config Configuration, currentSunrise time.Time, currentSunset time.Time, t time.Time) (time.Time, time.Time) {
 	sunriseTime := currentSunrise
 	sunsetTime := currentSunset
 	if currentSunrise.Day() == t.Add(-24*time.Hour).Day() ||
 		currentSunset.Day() == t.Add(-24*time.Hour).Day() {
-
-		logger.Info("fetching new sunrise and sunset values",
-			zap.String("op", "UpdateSunriseSunset"),
-		)
 
 		sunriseTime, sunsetTime = sunrise.SunriseSunset(
 			config.Latitude,
@@ -144,27 +198,15 @@ func Daylight(sunrise time.Time, sunset time.Time, t time.Time) bool {
 	}
 }
 
-func WriteToInflux(logger *zap.Logger, config Configuration, influxConn *influxdb.Client, daylight bool, t time.Time) error {
-	data := make([]influxdb.Point, 1)
-	data[0] = influxdb.Point{
-		Measurement: config.InfluxDBMeasurement,
-		Tags:        map[string]string{},
-		Fields: map[string]interface{}{
+func WriteToInflux(config Configuration, writeAPI influxAPI.WriteAPI, daylight bool, t time.Time) {
+	data := influx.NewPoint(
+		"daylight",
+		map[string]string{},
+		map[string]interface{}{
 			"daylight": daylight,
 		},
-		Time:      t,
-		Precision: "ns",
-	}
+		t,
+	)
 
-	batchData := influxdb.BatchPoints{
-		Points:          data,
-		Database:        config.InfluxDBDatabase,
-		RetentionPolicy: config.InfluxDBRetentionPolicy,
-	}
-
-	_, err := influxConn.Write(batchData)
-	if err != nil {
-		return err
-	}
-	return nil
+	writeAPI.WritePoint(data)
 }
