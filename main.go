@@ -20,6 +20,7 @@ type Configuration struct {
 	Latitude     float64
 	Longitude    float64
 	PollInterval time.Duration
+	TimeOffset   time.Duration
 	InfluxDB     InfluxDB
 }
 
@@ -154,8 +155,8 @@ func main() {
 
 			now = time.Now()
 			sunriseTime, sunsetTime = UpdateSunriseSunset(*config, sunriseTime, sunsetTime, now)
-			daylight := Daylight(sunriseTime, sunsetTime, now)
-			WriteToInflux(*config, writeAPI, daylight, now)
+			daylight, daylightOffset := Daylight(sunriseTime, sunsetTime, now, config.TimeOffset*time.Minute)
+			WriteToInflux(*config, writeAPI, daylight, daylightOffset, now)
 
 			timeElapsed := int32(time.Now().Unix()) - pollStartTime
 			time.Sleep(config.PollInterval*time.Second - time.Duration(timeElapsed)*time.Second)
@@ -190,20 +191,27 @@ func UpdateSunriseSunset(config Configuration, currentSunrise time.Time, current
 
 }
 
-func Daylight(sunrise time.Time, sunset time.Time, t time.Time) bool {
+func Daylight(sunrise time.Time, sunset time.Time, t time.Time, offset time.Duration) (currentDaylight, offsetDaylight bool) {
 	if t.Before(sunrise) || t.After(sunset) {
-		return false
+		currentDaylight = false
 	} else {
-		return true
+		currentDaylight = true
 	}
+	if t.Before(sunrise.Add(offset)) || t.After(sunset.Add(-offset)) {
+		offsetDaylight = false
+	} else {
+		offsetDaylight = true
+	}
+	return currentDaylight, offsetDaylight
 }
 
-func WriteToInflux(config Configuration, writeAPI influxAPI.WriteAPI, daylight bool, t time.Time) {
+func WriteToInflux(config Configuration, writeAPI influxAPI.WriteAPI, daylightCurrent, daylightOffset bool, t time.Time) {
 	data := influx.NewPoint(
 		"daylight",
 		map[string]string{},
 		map[string]interface{}{
-			"daylight": daylight,
+			"daylight":        daylightCurrent,
+			"daylight_offset": daylightOffset,
 		},
 		t,
 	)

@@ -6,6 +6,12 @@ longitude: -00.000000  # longitude of location to query daylighy status for
 # Polling
 pollInterval: 60  # time in seconds to wait in between daylight queries
 
+# Time
+# timeOffset is the number of minutes to offset daylight data, i.e. if
+# this is 30 then daylight will report as true starting 30 minutes after
+# sunrise and false 30 minutes before sunset
+timeOffset: 30
+
 # InfluxDB Configuration
 influxDB:
   address: https://127.0.0.1:8086  # HTTP address for InfluxDB
